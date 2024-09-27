@@ -1,25 +1,22 @@
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.spatial import cKDTree
-from lookupgrid import LookupGrid
-from tensorfield import CircularLogTensorField
-from rk4 import RK4Integrator
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
+from lookupgrid import LookupGrid
+
+from tensorfield import CircularLogTensorField
+
+# Constants for streamline states
+FORWARD = 'FORWARD'
+BACKWARD = 'BACKWARD'
+DONE = 'DONE'
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-
-FORWARD = 1
-BACKWARD = 2
-DONE = 3
-
 class StreamlineIntegrator:
     def __init__(self, start, grid, tensor_field, config):
-        """
-        Initializes the streamline integrator with a starting point, grid, tensor field, and configuration.
-        """
         self.points = [np.array(start, dtype=np.float64)]
         self.pos = np.array(start, dtype=np.float64)
         self.state = FORWARD
@@ -31,11 +28,9 @@ class StreamlineIntegrator:
         self.start = np.array(start, dtype=np.float64)
         self.tensor_field = tensor_field
         self.h = config['timeStep']
+        logging.debug(f"StreamlineIntegrator initialized with start {start}")
 
     def get_streamline(self):
-        """
-        Returns the list of points in the streamline.
-        """
         return self.points
 
     def get_next_valid_seed(self):
@@ -60,36 +55,13 @@ class StreamlineIntegrator:
                 logging.debug(f"Valid seed found at ({ox}, {oy})")
                 return np.array([ox, oy], dtype=np.float64)
 
-            logging.debug(f"No valid seed at point {p}")
         logging.debug("No more seeds found along this streamline")
         return None
 
-    def check_dtest(self, distance_to_candidate, p=None):
-        """
-        Checks if the distance to a candidate point is less than dTest.
-        """
-        if self.is_same(distance_to_candidate, self.config['dTest']):
-            return False
-        return distance_to_candidate < self.config['dTest']
-
-    def check_dsep(self, distance_to_candidate, p=None):
-        """
-        Checks if the distance to a candidate point is less than dSep.
-        """
-        if self.is_same(distance_to_candidate, self.config['dSep']):
-            return False
-        return distance_to_candidate < self.config['dSep']
-
-    def is_same(self, a, b):
-        """
-        Checks if two floating point numbers are approximately the same, avoiding floating point errors.
-        """
-        return abs(a - b) < 1e-4
+    def check_dsep(self, distance, p):
+        return distance < self.config['dSep']
 
     def next(self):
-        """
-        Advances the streamline by one step, growing it in the current direction.
-        """
         while True:
             self.candidate = None
             if self.state == FORWARD:
@@ -98,101 +70,65 @@ class StreamlineIntegrator:
                     self.points.append(point)
                     self.own_grid.occupy_coordinates(point)
                     self.pos = point
-                    should_pause = self.notify_point_added(point)
+                    should_pause = self.config['onPointAdded'](point, self.points[-2], self.config, self.points)
                     if should_pause:
-                        return False  # Pause to allow for new streamline
+                        return False
                 else:
-                    if self.config.get('forwardOnly', False):
+                    if self.config['forwardOnly']:
                         self.state = DONE
                     else:
                         self.pos = self.start
                         self.state = BACKWARD
-            elif self.state == BACKWARD:
+            if self.state == BACKWARD:
                 point = self.grow_backward()
                 if point is not None:
                     self.points.insert(0, point)
-                    self.pos = point
                     self.own_grid.occupy_coordinates(point)
-                    should_pause = self.notify_point_added(point)
+                    self.pos = point
+                    should_pause = self.config['onPointAdded'](point, self.points[1], self.config, self.points)
                     if should_pause:
-                        return False  # Pause to allow for new streamline
+                        return False
                 else:
                     self.state = DONE
             if self.state == DONE:
                 for p in self.points:
-                    self.occupy_point_in_grid(p)
-                return True  # Streamline is complete
-
-    def occupy_point_in_grid(self, p):
-        """
-        Marks a point as occupied in the main grid.
-        """
-        self.grid.occupy_coordinates(p)
+                    self.grid.occupy_coordinates(p)
+                return True
 
     def grow_forward(self):
-        """
-        Grows the streamline forward by one RK4 step.
-        """
-        displacement = self.rk4_step(self.pos, self.h)
-        if displacement is None:
-            return None  # Hit a singularity
-        return self.grow_by_velocity(self.pos, displacement)
+        velocity = self.rk4_step(self.pos, self.h)
+        if velocity is None:
+            return None
+        return self.grow_by_velocity(self.pos, velocity)
 
     def grow_backward(self):
-        """
-        Grows the streamline backward by one RK4 step.
-        """
-        displacement = self.rk4_step(self.pos, self.h)
-        if displacement is None:
+        velocity = self.rk4_step(self.pos, self.h)
+        if velocity is None:
             return None
-        displacement = -displacement
-        return self.grow_by_velocity(self.pos, displacement)
+        velocity = -velocity
+        return self.grow_by_velocity(self.pos, velocity)
 
-    def grow_by_velocity(self, pos, displacement):
-        """
-        Attempts to grow the streamline by the given displacement, checking termination conditions.
-        """
-        candidate = pos + displacement
+    def grow_by_velocity(self, pos, velocity):
+        candidate = pos + velocity
         if self.grid.is_outside(candidate[0], candidate[1]):
             return None
-        if self.grid.is_taken(candidate[0], candidate[1], self.check_dtest):
+        if self.grid.is_taken(candidate[0], candidate[1], self.check_dsep):
             return None
-        if self.own_grid.is_taken(candidate[0], candidate[1], self.time_step_check):
+        if self.own_grid.is_taken(candidate[0], candidate[1], lambda d, p: d < self.h * 0.9):
             return None
         return candidate
 
-    def time_step_check(self, distance_to_candidate, p=None):
-        """
-        Checks if the distance to a candidate point is less than the time step, indicating a possible loop.
-        """
-        return distance_to_candidate < self.config['timeStep'] * 0.9
-
-    def notify_point_added(self, point):
-        """
-        Callback function executed when a point is added to the streamline.
-        """
-        should_pause = False
-        if self.config.get('onPointAdded', None) is not None:
-            previous_point = self.points[-2] if self.state == FORWARD and len(self.points) >= 2 else None
-            should_pause = self.config['onPointAdded'](point, previous_point, self.config, self.points)
-        return should_pause
-
     def normalized_vector_field(self, p):
-        """
-        Evaluates and normalizes the vector field at point p.
-        """
-        v = self.config['vectorField'](p, self.points, self.state == DONE)
-        if v is None or np.isnan(v[0]) or np.isnan(v[1]):
+        v = self.tensor_field.get_vector(p[0], p[1])
+        if v is None or np.isnan(v).any():
             return None
         norm = np.linalg.norm(v)
         if norm == 0:
+            logging.debug(f"Vector field at {p} is zero")
             return None
         return v / norm
 
     def rk4_step(self, pos, h):
-        """
-        Performs a single RK4 integration step to compute the displacement.
-        """
         v1 = self.normalized_vector_field(pos)
         if v1 is None:
             return None
@@ -221,9 +157,6 @@ class StreamlineIntegrator:
 
 class EvenlySpacedStreamlines:
     def __init__(self, tensor_field, dsep, dtest):
-        """
-        Initializes the EvenlySpacedStreamlines class with the given tensor field, separation distances, and plot setup.
-        """
         logging.info("Initializing EvenlySpacedStreamlines")
         self.tensor_field = tensor_field
         self.dsep = dsep
@@ -247,7 +180,6 @@ class EvenlySpacedStreamlines:
         }
         self.integrators = []
 
-        # Set up the plot
         plt.ion()
         self.fig, self.ax = plt.subplots(figsize=(10, 10))
         self.ax.set_xlim(-5, 5)
@@ -259,17 +191,11 @@ class EvenlySpacedStreamlines:
         logging.info("Plot setup complete")
 
     def vector_field(self, p, points, done):
-        """
-        Returns the vector at point p from the tensor field.
-        """
         x, y = p[0], p[1]
         v = self.tensor_field.get_vector(x, y)
         return v
 
     def on_point_added(self, point, previous_point, config, points):
-        """
-        Callback executed when a point is added to a streamline. Updates the plot in real-time.
-        """
         if previous_point is not None:
             self.ax.plot(
                 [previous_point[0], point[0]],
@@ -279,7 +205,7 @@ class EvenlySpacedStreamlines:
             )
             self.fig.canvas.draw()
             self.fig.canvas.flush_events()
-        return False  # Continue integration without pausing
+        return False
 
     def compute_streamlines(self, x_range, y_range):
         logging.info("Starting streamline computation")
@@ -319,33 +245,22 @@ class EvenlySpacedStreamlines:
         logging.info(f"Time taken: {end_time - start_time:.2f} seconds")
 
     def add_streamline(self, seed):
-        """
-        Adds a new streamline starting from the given seed.
-        """
         logging.info(f"Adding streamline with seed {seed}")
         integrator = StreamlineIntegrator(seed, self.lookup_grid, self.tensor_field, self.config)
         self.integrators.append(integrator)
 
     def get_random_seed(self, x_range, y_range):
-        """
-        Generates a random seed within the specified x and y ranges.
-        """
         x = np.random.uniform(*x_range)
         y = np.random.uniform(*y_range)
         return np.array([x, y], dtype=np.float64)
 
     def finalize_plot(self):
-        """
-        Finalizes the plot by turning off interactive mode and displaying the plot.
-        """
         logging.info("Finalizing plot")
         plt.ioff()
         plt.show()
 
-# Example usage
 if __name__ == "__main__":
     logging.info("Starting streamline generation process")
-    # You should define or import your tensor field class here
     tensor_field = CircularLogTensorField()
     streamline_generator = EvenlySpacedStreamlines(tensor_field, dsep=0.1, dtest=0.005)
     streamline_generator.compute_streamlines(x_range=(-5, 5), y_range=(-5, 5))
